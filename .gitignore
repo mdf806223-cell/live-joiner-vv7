@@ -1,0 +1,8 @@
+accounts.json
+admins.json
+*.session
+*.session-journal
+__pycache__/
+.env
+.venv/
+venv/

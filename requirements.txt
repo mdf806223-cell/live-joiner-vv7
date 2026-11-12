@@ -1,0 +1,4 @@
+python-telegram-bot==21.6
+telethon==1.45.0
+py-tgcalls==3.0.0
+aiohttp==3.9.5
