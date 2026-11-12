@@ -49,7 +49,8 @@ from telethon.sessions import StringSession
 from telethon.utils import get_peer_id
 from telethon.errors import (
     SessionPasswordNeededError, PhoneCodeInvalidError,
-    PhoneCodeExpiredError, FloodWaitError
+    PhoneCodeExpiredError, FloodWaitError,
+    AuthKeyUnregisteredError, AuthKeyInvalidError
 )
 from telethon.tl.functions.channels import JoinChannelRequest, GetFullChannelRequest
 from telethon.tl.functions.messages import (
@@ -66,7 +67,9 @@ from telethon.tl.types import (
 
 from pytgcalls import PyTgCalls
 from pytgcalls.types import GroupCallConfig
-from pytgcalls.exceptions import NoActiveGroupCall, NotInCallError
+from pytgcalls.exceptions import (
+    NoActiveGroupCall, NotInCallError, MTProtoClientNotConnected
+)
 
 import re as _re
 def _esc(s):
@@ -194,14 +197,68 @@ def is_admin(update: Update) -> bool:
     u = update.effective_user
     return bool(u and is_admin_user(u.id))
 
+async def _drop_client(phone: str):
+    """Disconnect and forget the cached Telethon client for a phone."""
+    client = active_clients.pop(phone, None)
+    if client is not None:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+
 async def get_client(phone: str, session_str: str) -> TelegramClient:
-    if phone in active_clients:
-        c = active_clients[phone]
-        if not c.is_connected():
-            await c.connect()
-        return c
-    c = TelegramClient(StringSession(session_str), API_ID, API_HASH)
-    await c.connect()
+    """Return a connected, authorized Telethon client for a phone.
+
+    The old version only checked is_connected() on the cached client
+    and never checked authorization. After an account is removed /
+    logged out and then re-imported, the cached client (and the
+    PyTgCalls engine bound to it) can be stale, so the first real
+    call fails with MTProtoClientNotConnected. Here we verify the
+    cached client and rebuild it from the session string when needed.
+    A session that Telegram has terminated cannot be revived — that
+    raises a clear error instead of a cryptic MTProto error.
+    """
+    c = active_clients.get(phone)
+    if c is not None:
+        try:
+            if not c.is_connected():
+                await c.connect()
+            if await c.is_user_authorized():
+                return c
+        except (AuthKeyUnregisteredError, AuthKeyInvalidError):
+            pass
+        except Exception:
+            pass
+        # Stale / unauthorized cached client — drop it and rebuild.
+        await _drop_client(phone)
+        call_engines.pop(phone, None)
+    try:
+        c = TelegramClient(StringSession(session_str), API_ID, API_HASH)
+        await c.connect()
+    except (AuthKeyUnregisteredError, AuthKeyInvalidError):
+        raise RuntimeError(
+            f"{phone}: Session expired / logged out — "
+            "add this account again with OTP. "
+            "Import cannot revive a terminated session."
+        )
+    try:
+        if not await c.is_user_authorized():
+            try:
+                await c.disconnect()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"{phone}: Session expired / logged out — "
+                "add this account again with OTP. "
+                "Import cannot revive a terminated session."
+            )
+    except RuntimeError:
+        raise
+    except (AuthKeyUnregisteredError, AuthKeyInvalidError):
+        raise RuntimeError(
+            f"{phone}: Session expired / logged out — "
+            "add this account again with OTP."
+        )
     active_clients[phone] = c
     return c
 
@@ -568,6 +625,15 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             logging.info(f"[{phone}] ✅ Joined live via REAL UDP engine")
         except NoActiveGroupCall:
             errors.append(f"{phone}: No active live call found — check if the live is running")
+        except MTProtoClientNotConnected:
+            # Stale engine/client (e.g. after remove + import). Drop both
+            # so the next Join Live attempt builds a fresh engine/client.
+            _drop_engine(phone)
+            await _drop_client(phone)
+            errors.append(
+                f"{phone}: MTProto disconnected — engine reset, "
+                "please press Join Live again"
+            )
         except Exception as e:
             logging.exception(f"[{phone}] Live join failed")
             errors.append(f"{phone}: {type(e).__name__}: {e}")
@@ -693,8 +759,25 @@ def _register_stream_loop(engine: PyTgCalls, phone: str):
         except Exception as e:
             logging.warning(f"[{phone}] stream replay: {e}")
 
+def _drop_engine(phone: str):
+    """Forget the cached PyTgCalls engine for a phone.
+
+    PyTgCalls 3.x has no stop() — dropping the reference is enough;
+    the next join creates a fresh engine bound to the current client.
+    """
+    call_engines.pop(phone, None)
+
 async def _get_engine(phone: str, client: TelegramClient) -> PyTgCalls:
     eng = call_engines.get(phone)
+    if eng is not None:
+        # The engine is bound to the Telethon client it was created
+        # with. After remove/import that client is a different,
+        # disconnected object — reusing the old engine is exactly
+        # what raised MTProtoClientNotConnected on engine.play().
+        bound = getattr(eng, "mtproto_client", None)
+        if bound is not client or not client.is_connected():
+            _drop_engine(phone)
+            eng = None
     if eng is None:
         eng = PyTgCalls(client, workers=2)
         call_engines[phone] = eng
@@ -965,6 +1048,9 @@ async def confirm_remove_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
     _stop_watchdog(phone)
+    _drop_engine(phone)
+    live_state.pop(phone, None)
+    live_handlers.pop(phone, None)
     save_accounts(accs)
     await q.edit_message_text(
         f"✅  ACCOUNT REMOVED\n"
@@ -984,6 +1070,9 @@ async def confirm_remove_all_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     accs = load_accounts()
     for phone in list(accs.keys()):
         _stop_watchdog(phone)
+        _drop_engine(phone)
+        live_state.pop(phone, None)
+        live_handlers.pop(phone, None)
         client = active_clients.pop(phone, None)
         if client:
             try:
