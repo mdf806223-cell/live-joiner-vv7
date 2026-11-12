@@ -9,6 +9,34 @@ from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup,
     ReplyKeyboardMarkup, KeyboardButton, constants
 )
+
+# ── Styled Inline Button (Bot API 9.4+) ──────────────────────
+class Btn(InlineKeyboardButton):
+    """InlineKeyboardButton with style support (Bot API 9.4+)."""
+    def __init__(self, *args, style: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        if style:
+            self.style = style
+
+    def to_dict(self):
+        d = super().to_dict()
+        if getattr(self, "style", ""):
+            d["style"] = self.style
+        return d
+
+# ── Styled Reply Keyboard Button (Bot API 9.4+) ───────────────
+class SBtn(KeyboardButton):
+    """KeyboardButton with style support (Bot API 9.4+)."""
+    def __init__(self, *args, style: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        if style:
+            self.style = style
+
+    def to_dict(self):
+        d = super().to_dict()
+        if getattr(self, "style", ""):
+            d["style"] = self.style
+        return d
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, ConversationHandler, filters
@@ -81,8 +109,15 @@ live_state      = {}
 # ─── HELPERS ───────────────────────────────────────────────────────────────────
 def main_kb():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("➕ Add Account"), KeyboardButton("📋 My Accounts")],
-        [KeyboardButton("🚀 Join Live Now")],
+        [SBtn("➕ Add Account", style="primary"), SBtn("📋 My Accounts", style="primary")],
+        [SBtn("🚀 Join Live Now", style="danger")],
+    ], resize_keyboard=True)
+
+def live_kb():
+    return ReplyKeyboardMarkup([
+        [SBtn("➕ Add Account", style="primary"), SBtn("📋 My Accounts", style="primary")],
+        [SBtn("🚀 Join Live Now", style="danger")],
+        [SBtn("✋ Hand Raise All", style="success"), SBtn("🔴 Leave Live", style="danger")],
     ], resize_keyboard=True)
 
 def is_owner(update: Update) -> bool:
@@ -150,6 +185,10 @@ async def menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await show_list(update, ctx)
     elif "🚀" in t:
         return await live_start(update, ctx)
+    elif "✋" in t:
+        return await hand_raise_reply(update, ctx)
+    elif "🔴 Leave Live" in t:
+        return await live_leave_reply(update, ctx)
     await update.message.reply_text("Please use the buttons 👇", reply_markup=main_kb())
     return MAIN_MENU
 
@@ -275,10 +314,10 @@ async def show_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append(f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n Total  ›  {len(accs)} Accounts")
     # Build remove buttons for each account
     buttons = [
-        [InlineKeyboardButton(f"🗑️ Remove {ph}", callback_data=f"remove:{ph}")]
+        [Btn(f"🗑️ Remove {ph}", callback_data=f"remove:{ph}", style="danger")]
         for ph in accs
     ]
-    buttons.append([InlineKeyboardButton("🗑️ Remove All Accounts", callback_data="remove_all")])
+    buttons.append([Btn("🗑️ Remove All Accounts", callback_data="remove_all", style="danger")])
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons)
@@ -399,11 +438,10 @@ async def _do_join(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"  📡  Mode     »   UDP Active\n"
         f"  🔇  Audio    »   Muted\n\n"
         f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
-        f"  Auto-leave is DISABLED ✓",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✋ Hand Raise All", callback_data=f"handrise:{chat_id}")],
-            [InlineKeyboardButton("🔴 Leave Live", callback_data=f"leave:{chat_id}")]
-        ])
+        f"  Auto-leave is DISABLED ✓"
+    )
+    await update.message.reply_text(
+        "✅ Live joined! Use buttons below 👇", reply_markup=live_kb()
     )
     if count > len(joined) and errors:
         uniq = list(dict.fromkeys(errors))[:4]
@@ -598,26 +636,15 @@ def _stop_watchdog(phone: str):
     if task and not task.done():
         task.cancel()
 
-async def hand_rise_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin_user(q.from_user.id):
-        await q.answer("⛔ Only owner/admin!", show_alert=True)
-        return
-    chat_id = int(q.data.split(":")[1])
+async def _do_hand_raise(chat_id: int, accs: dict) -> tuple:
+    """Hand raise logic — shared by reply & inline handlers."""
     session = live_sessions.get(chat_id)
     if not session:
-        await q.answer("⚠️ No active session found.", show_alert=True)
-        return
-
-    phones = session["phones"]
+        return None, 0, 0
+    phones    = session["phones"]
     calls_map = session["calls"]
-    accs = load_accounts()
     success = 0
-    fail = 0
-
-    await q.answer("✋ Raising hands...", show_alert=False)
-
+    fail    = 0
     for phone in phones:
         info = accs.get(phone)
         if not info:
@@ -628,8 +655,6 @@ async def hand_rise_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             continue
         try:
             client = await get_client(phone, info["session"])
-            me = await client.get_me()
-            # Hand raise করতে raise_hand=True দিতে হয়
             await client(EditGroupCallParticipantRequest(
                 call=call,
                 participant=InputPeerSelf(),
@@ -641,41 +666,15 @@ async def hand_rise_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.warning(f"[HAND_RAISE] {phone} ❌ {e}")
             fail += 1
-
-    # মেসেজ edit করে জানাই
-    try:
-        await q.edit_message_text(
-            f"🟢  LIVE CONNECTION ACTIVE\n"
-            f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n\n"
-            f"  ✅  Joined   »   {len(phones)} accounts\n"
-            f"  ❌  Failed   »   {session.get('failed', 0)} accounts\n"
-            f"  📡  Mode     »   UDP Active\n"
-            f"  🔇  Audio    »   Muted\n"
-            f"  ✋  Raised   »   {success} ✅  {fail} ❌\n\n"
-            f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✋ Hand Raise All", callback_data=f"handrise:{chat_id}")],
-                [InlineKeyboardButton("🔴 Leave Live", callback_data=f"leave:{chat_id}")]
-            ])
-        )
-    except Exception:
-        pass
+    return session, success, fail
 
 
-async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    if not is_admin_user(q.from_user.id):
-        await q.answer("⛔ Only owner/admin!", show_alert=True)
-        return
-    chat_id = int(q.data.split(":")[1])
+async def _do_leave(chat_id: int, accs: dict) -> int:
+    """Leave logic — shared by reply & inline handlers."""
     session = live_sessions.get(chat_id)
     if not session:
-        await q.edit_message_text("⚠️ No active session found.")
-        return
-    await q.edit_message_text("⏳ Leaving all accounts...")
+        return -1
     left = 0
-    accs = load_accounts()
     for phone in session["phones"]:
         _stop_watchdog(phone)
         st     = live_state.pop(phone, {})
@@ -703,13 +702,53 @@ async def live_leave_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logging.error(f"[LEAVE] {phone}: {e}")
     del live_sessions[chat_id]
-    await q.edit_message_text(
+    return left
+
+
+# ── Reply keyboard handlers (✋ Hand Raise All / 🔴 Leave Live) ───────────────
+async def hand_raise_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return ConversationHandler.END
+    chat_id = update.effective_chat.id
+    accs    = load_accounts()
+    session, success, fail = await _do_hand_raise(chat_id, accs)
+    if session is None:
+        await update.message.reply_text(
+            "⚠️ No active live session found.", reply_markup=live_kb()
+        )
+        return MAIN_MENU
+    await update.message.reply_text(
+        f"✋  HAND RAISE DONE\n"
+        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
+        f"  ✅  Raised  »  {success} accounts\n"
+        f"  ❌  Failed  »  {fail} accounts\n"
+        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰",
+        reply_markup=live_kb()
+    )
+    return MAIN_MENU
+
+
+async def live_leave_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return ConversationHandler.END
+    chat_id = update.effective_chat.id
+    accs    = load_accounts()
+    await update.message.reply_text("⏳ Leaving all accounts...")
+    left = await _do_leave(chat_id, accs)
+    if left == -1:
+        await update.message.reply_text(
+            "⚠️ No active live session found.", reply_markup=main_kb()
+        )
+        return MAIN_MENU
+    await update.message.reply_text(
         f"👋  SESSION ENDED\n"
         f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
         f"  ✅  Left Successfully\n"
         f"  📊  Accounts Left  »  {left}\n"
-        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰"
+        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰",
+        reply_markup=main_kb()
     )
+    return MAIN_MENU
 
 async def remove_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -732,8 +771,8 @@ async def remove_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"  Remove this account?",
         reply_markup=InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Yes, Remove", callback_data=f"confirm_remove:{phone}"),
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove"),
+                Btn("✅ Yes, Remove", callback_data=f"confirm_remove:{phone}", style="success"),
+                Btn("❌ Cancel",      callback_data="cancel_remove",           style="danger"),
             ]
         ])
     )
@@ -752,8 +791,8 @@ async def remove_all_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"  {n} accounts permanently.",
         reply_markup=InlineKeyboardMarkup([
             [
-                InlineKeyboardButton("✅ Yes, Remove All", callback_data="confirm_remove_all"),
-                InlineKeyboardButton("❌ Cancel", callback_data="cancel_remove"),
+                Btn("✅ Yes, Remove All", callback_data="confirm_remove_all", style="success"),
+                Btn("❌ Cancel",          callback_data="cancel_remove",      style="danger"),
             ]
         ])
     )
@@ -909,8 +948,6 @@ async def main():
         allow_reentry=True,
     )
     app.add_handler(conv)
-    app.add_handler(CallbackQueryHandler(hand_rise_cb,          pattern=r"^handrise:"))
-    app.add_handler(CallbackQueryHandler(live_leave_cb,         pattern=r"^leave:"))
     app.add_handler(CallbackQueryHandler(remove_cb,             pattern=r"^remove:"))
     app.add_handler(CallbackQueryHandler(remove_all_cb,         pattern=r"^remove_all$"))
     app.add_handler(CallbackQueryHandler(confirm_remove_cb,     pattern=r"^confirm_remove:"))
