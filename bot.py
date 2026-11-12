@@ -1,8 +1,10 @@
 import os
 import asyncio
+import io
 import json
 import logging
 import time
+from datetime import datetime
 from aiohttp import web
 
 from telegram import (
@@ -15,13 +17,14 @@ class Btn(InlineKeyboardButton):
     """InlineKeyboardButton with style support (Bot API 9.4+)."""
     def __init__(self, *args, style: str = "", **kwargs):
         super().__init__(*args, **kwargs)
-        if style:
-            self.style = style
+        # NOTE: PTB TelegramObject is frozen after __init__, so a plain
+        # self.style = ... raises AttributeError. Store it privately.
+        self._style = style
 
-    def to_dict(self):
-        d = super().to_dict()
-        if getattr(self, "style", ""):
-            d["style"] = self.style
+    def to_dict(self, *args, **kwargs):
+        d = super().to_dict(*args, **kwargs)
+        if getattr(self, "_style", ""):
+            d["style"] = self._style
         return d
 
 # ── Styled Reply Keyboard Button (Bot API 9.4+) ───────────────
@@ -29,13 +32,13 @@ class SBtn(KeyboardButton):
     """KeyboardButton with style support (Bot API 9.4+)."""
     def __init__(self, *args, style: str = "", **kwargs):
         super().__init__(*args, **kwargs)
-        if style:
-            self.style = style
+        # See Btn above: use a private attribute, PTB objects are frozen.
+        self._style = style
 
-    def to_dict(self):
-        d = super().to_dict()
-        if getattr(self, "style", ""):
-            d["style"] = self.style
+    def to_dict(self, *args, **kwargs):
+        d = super().to_dict(*args, **kwargs)
+        if getattr(self, "_style", ""):
+            d["style"] = self._style
         return d
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
@@ -85,7 +88,7 @@ PORT          = int(os.environ.get("PORT", "10000"))   # Render দেয়
 KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL", "4"))
 
 # ─── STATES ────────────────────────────────────────────────────────────────────
-MAIN_MENU, WAIT_PHONE, WAIT_CODE, WAIT_2FA, WAIT_LINK, WAIT_COUNT = range(6)
+MAIN_MENU, WAIT_PHONE, WAIT_CODE, WAIT_2FA, WAIT_LINK, WAIT_COUNT, WAIT_IMPORT = range(7)
 
 # ─── STORAGE ───────────────────────────────────────────────────────────────────
 def load_accounts():
@@ -97,6 +100,43 @@ def load_accounts():
 def save_accounts(data):
     with open(ACCOUNTS_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+def parse_import_data(data):
+    """Normalize exported accounts data to {phone: {name, session}}.
+
+    Accepts our export format (dict: phone -> {name, session}),
+    a single account (dict with phone + session),
+    and a list format ([{phone, name, session}, ...]).
+    Returns (entries, invalid_count). Raises ValueError on bad format.
+    """
+    entries = {}
+    invalid = 0
+    items = []
+    if isinstance(data, dict):
+        if "session" in data and "phone" in data:
+            items = [(data.get("phone"), data)]
+        else:
+            items = list(data.items())
+    elif isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict) and "phone" in item:
+                items.append((item.get("phone"), item))
+            else:
+                invalid += 1
+    else:
+        raise ValueError("File format not recognized")
+    for phone_raw, info in items:
+        if not isinstance(info, dict):
+            invalid += 1
+            continue
+        session = str(info.get("session") or "").strip()
+        phone = str(phone_raw or info.get("phone") or "").strip().replace(" ", "")
+        if not phone or len(session) < 20:
+            invalid += 1
+            continue
+        name = str(info.get("name") or phone).strip()
+        entries[phone] = {"name": name, "session": session}
+    return entries, invalid
 
 pending_clients = {}
 active_clients  = {}
@@ -110,15 +150,21 @@ live_state      = {}
 def main_kb():
     return ReplyKeyboardMarkup([
         [SBtn("➕ Add Account", style="primary"), SBtn("📋 My Accounts", style="primary")],
+        [SBtn("📥 Import Accounts", style="primary"), SBtn("📤 Export Accounts", style="primary")],
         [SBtn("🚀 Join Live Now", style="danger")],
     ], resize_keyboard=True)
 
 def live_kb():
     return ReplyKeyboardMarkup([
         [SBtn("➕ Add Account", style="primary"), SBtn("📋 My Accounts", style="primary")],
+        [SBtn("📥 Import Accounts", style="primary"), SBtn("📤 Export Accounts", style="primary")],
         [SBtn("🚀 Join Live Now", style="danger")],
         [SBtn("✋ Hand Raise All", style="success"), SBtn("🔴 Leave Live", style="danger")],
     ], resize_keyboard=True)
+
+def _kb_for_chat(chat_id):
+    """Main keyboard, or live keyboard when a live session is active."""
+    return live_kb() if chat_id in live_sessions else main_kb()
 
 def is_owner(update: Update) -> bool:
     return bool(update.effective_user and update.effective_user.id == OWNER_ID)
@@ -183,6 +229,10 @@ async def menu_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await add_start(update, ctx)
     elif "📋" in t:
         return await show_list(update, ctx)
+    elif "📥" in t or "Import" in t:
+        return await import_start(update, ctx)
+    elif "📤" in t or "Export" in t:
+        return await export_accounts(update, ctx)
     elif "🚀" in t:
         return await live_start(update, ctx)
     elif "✋" in t:
@@ -321,6 +371,102 @@ async def show_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "\n".join(lines),
         reply_markup=InlineKeyboardMarkup(buttons)
+    )
+    return MAIN_MENU
+
+async def export_accounts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Send all saved accounts (with session strings) as a .json file."""
+    if not is_admin(update):
+        return ConversationHandler.END
+    accs = load_accounts()
+    chat_id = update.effective_chat.id
+    if not accs:
+        await update.message.reply_text(
+            "📤 No accounts saved yet to export.",
+            reply_markup=_kb_for_chat(chat_id)
+        )
+        return MAIN_MENU
+    data = json.dumps(accs, indent=2, ensure_ascii=False).encode("utf-8")
+    filename = (
+        f"live-joiner-accounts-{len(accs)}-"
+        f"{datetime.now().strftime('%Y%m%d-%H%M')}.json"
+    )
+    await update.message.reply_document(
+        document=io.BytesIO(data),
+        filename=filename,
+        caption=(
+            f"📤 Exported {len(accs)} accounts.\n"
+            "⚠️ This file contains session strings — "
+            "keep it private, don't share it."
+        ),
+    )
+    return MAIN_MENU
+
+async def import_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return ConversationHandler.END
+    n = len(load_accounts())
+    await update.message.reply_text(
+        "📥  IMPORT ACCOUNTS\n"
+        "▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
+        f"  Already saved: {n} accounts\n\n"
+        "Send the exported .json file here 👇\n"
+        "(Export button theke pawa file)\n\n"
+        "Send /cancel to go back."
+    )
+    return WAIT_IMPORT
+
+async def got_import_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return ConversationHandler.END
+    chat_id = update.effective_chat.id
+    doc = update.message.document if update.message else None
+    if not doc:
+        await update.message.reply_text(
+            "⚠️ Please upload the exported .json file, "
+            "or /cancel to go back."
+        )
+        return WAIT_IMPORT
+    try:
+        tg_file = await doc.get_file()
+        buf = io.BytesIO()
+        await tg_file.download_to_memory(buf)
+        data = json.loads(buf.getvalue().decode("utf-8"))
+        entries, invalid = parse_import_data(data)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not read that file: {e}\n"
+            "Please upload the file exported from the Export button.",
+            reply_markup=_kb_for_chat(chat_id)
+        )
+        return MAIN_MENU
+    if not entries:
+        await update.message.reply_text(
+            "⚠️ No valid accounts found in this file.",
+            reply_markup=_kb_for_chat(chat_id)
+        )
+        return MAIN_MENU
+    accs = load_accounts()
+    added = 0
+    skipped = 0
+    for phone, info in entries.items():
+        if phone in accs:
+            skipped += 1
+            continue
+        accs[phone] = info
+        added += 1
+    if added:
+        save_accounts(accs)
+    await update.message.reply_text(
+        "✅  IMPORT DONE\n"
+        "▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
+        f"  ✅  Added          »  {added} accounts\n"
+        f"  ⏭️  Already saved  »  {skipped} accounts\n"
+        f"  ❌  Invalid        »  {invalid} accounts\n"
+        f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
+        f"  📊  Total now      »  {len(accs)} accounts\n\n"
+        "Imported accounts can join live right away.",
+        reply_markup=_kb_for_chat(chat_id)
     )
     return MAIN_MENU
 
@@ -943,6 +1089,10 @@ async def main():
             WAIT_2FA:   [MessageHandler(filters.TEXT & ~filters.COMMAND, got_2fa)],
             WAIT_LINK:  [MessageHandler(filters.TEXT & ~filters.COMMAND, got_link)],
             WAIT_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_count)],
+            WAIT_IMPORT: [
+                MessageHandler(filters.Document.ALL & ~filters.COMMAND, got_import_file),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, got_import_file),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
         allow_reentry=True,
