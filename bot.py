@@ -152,6 +152,7 @@ def main_kb():
         [SBtn("➕ Add Account", style="primary"), SBtn("📋 My Accounts", style="primary")],
         [SBtn("📥 Import Accounts", style="primary"), SBtn("📤 Export Accounts", style="primary")],
         [SBtn("🚀 Join Live Now", style="danger")],
+        [SBtn("✋ Hand Raise All", style="success"), SBtn("🔴 Leave Live", style="danger")],
     ], resize_keyboard=True)
 
 def live_kb():
