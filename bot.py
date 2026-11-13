@@ -268,10 +268,10 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Only owner/admin allowed.")
         return ConversationHandler.END
     await update.message.reply_text(
-        "⚡ *ACCOUNT MANAGER BOT*\n"
+        "⚡ *LIVE JOINER BOT*\n"
         "▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
-        "Welcome\\! Manage your Telegram\n"
-        "accounts with ease\\.\n"
+        "Welcome\\! Join live with your\n"
+        "Telegram accounts\\.\n"
         "▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
         "Choose an option below 👇",
         parse_mode="MarkdownV2",
