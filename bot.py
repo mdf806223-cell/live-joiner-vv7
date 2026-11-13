@@ -273,7 +273,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Welcome\\! Join live with your\n"
         "Telegram accounts\\.\n"
         "▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"
-        "Choose an option below 👇",
+        "Choose an option below 👇\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👨‍💻 *Developed by @DARKXHACKERR*",
         parse_mode="MarkdownV2",
         reply_markup=main_kb()
     )

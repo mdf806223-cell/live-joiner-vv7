@@ -1,5 +1,7 @@
 # 🤖 Telegram Live Join Bot — Render + Cron-job.org Setup
 
+👨‍💻 **Developed by @DARKXHACKERR**
+
 ## ✅ Features
 - Multiple Telegram account add/login (Telethon)
 - Live join with real UDP/WebRTC connection (py-tgcalls)
