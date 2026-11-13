@@ -4,6 +4,8 @@ import io
 import json
 import logging
 import time
+import urllib.request
+import urllib.error
 from datetime import datetime
 from aiohttp import web
 
@@ -86,6 +88,8 @@ OWNER_ID      = int(os.environ.get("OWNER_ID", "0"))
 API_ID        = int(os.environ.get("API_ID", "0"))
 API_HASH      = os.environ.get("API_HASH", "")
 ACCOUNTS_FILE = "accounts.json"
+# Cloud storage URL comes only from the environment, never hardcoded.
+_CLOUD_DB_URL = os.environ.get("FIREBASE_DATABASE_URL", "").strip().rstrip("/")
 PORT          = int(os.environ.get("PORT", "10000"))   # Render দেয়
 
 KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL", "4"))
@@ -94,51 +98,138 @@ KEEPALIVE_INTERVAL = float(os.environ.get("KEEPALIVE_INTERVAL", "4"))
 MAIN_MENU, WAIT_PHONE, WAIT_CODE, WAIT_2FA, WAIT_LINK, WAIT_COUNT, WAIT_IMPORT = range(7)
 
 # ─── STORAGE ───────────────────────────────────────────────────────────────────
-def load_accounts():
+# Accounts live in cloud storage when it is configured, with the local
+# file kept as a silent backup. Any cloud failure falls back to the
+# local file without ever surfacing a storage error to the user.
+def _load_local_accounts():
     if os.path.exists(ACCOUNTS_FILE):
-        with open(ACCOUNTS_FILE) as f:
-            return json.load(f)
+        try:
+            with open(ACCOUNTS_FILE) as f:
+                data = json.load(f)
+            return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
     return {}
 
+def _save_local_accounts(data):
+    try:
+        with open(ACCOUNTS_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+    except Exception:
+        pass
+
+def _cloud_get_accounts():
+    """Return the accounts dict from cloud storage, {} if empty,
+    or None when cloud storage is not configured / unreachable."""
+    if not _CLOUD_DB_URL:
+        return None
+    try:
+        req = urllib.request.Request(
+            _CLOUD_DB_URL + "/accounts.json",
+            headers={"Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.load(resp)
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        out = {}
+        for phone, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            session = str(info.get("session") or "").strip()
+            if not session:
+                continue
+            entry = {
+                "name": str(info.get("name") or phone).strip(),
+                "session": session,
+                "2fa_password": str(info.get("2fa_password") or "").strip(),
+            }
+            if info.get("added_at"):
+                entry["added_at"] = str(info.get("added_at"))
+            if info.get("source"):
+                entry["source"] = str(info.get("source"))
+            out[str(phone)] = entry
+        return out
+    except Exception as e:
+        logging.warning("cloud read failed, using local backup: %s", e)
+        return None
+
+def _cloud_put_accounts(data):
+    """Write the whole accounts dict to cloud storage. True on success."""
+    if not _CLOUD_DB_URL:
+        return False
+    try:
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        req = urllib.request.Request(
+            _CLOUD_DB_URL + "/accounts.json",
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="PUT",
+        )
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resp.read()
+        return True
+    except Exception as e:
+        logging.warning("cloud write failed, local backup kept: %s", e)
+        return False
+
+def load_accounts():
+    local = _load_local_accounts()
+    cloud = _cloud_get_accounts()
+    if cloud is None:
+        return local
+    if not cloud and local:
+        # Cloud is empty but we have local accounts (first run after
+        # setup): push the local accounts up instead of losing them.
+        _cloud_put_accounts(local)
+        return local
+    _save_local_accounts(cloud)
+    return cloud
+
 def save_accounts(data):
-    with open(ACCOUNTS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    # Local backup first, always. Then cloud, silently on failure.
+    _save_local_accounts(data)
+    _cloud_put_accounts(data)
 
 def parse_import_data(data):
-    """Normalize exported accounts data to {phone: {name, session}}.
+    """Normalize exported accounts data to {phone: {name, session, ...}}.
 
-    Accepts our export format (dict: phone -> {name, session}),
-    a single account (dict with phone + session),
-    and a list format ([{phone, name, session}, ...]).
+    ONLY our own export format is accepted: a dict of
+    phone -> {name, session, 2fa_password?, added_at?, source?}.
+    List format and single-account dicts are rejected with ValueError.
     Returns (entries, invalid_count). Raises ValueError on bad format.
     """
+    if not isinstance(data, dict):
+        raise ValueError("File format not recognized")
+    if "session" in data or "phone" in data:
+        raise ValueError("File format not recognized")
     entries = {}
     invalid = 0
-    items = []
-    if isinstance(data, dict):
-        if "session" in data and "phone" in data:
-            items = [(data.get("phone"), data)]
-        else:
-            items = list(data.items())
-    elif isinstance(data, list):
-        for item in data:
-            if isinstance(item, dict) and "phone" in item:
-                items.append((item.get("phone"), item))
-            else:
-                invalid += 1
-    else:
-        raise ValueError("File format not recognized")
-    for phone_raw, info in items:
+    for phone_raw, info in data.items():
         if not isinstance(info, dict):
             invalid += 1
             continue
         session = str(info.get("session") or "").strip()
-        phone = str(phone_raw or info.get("phone") or "").strip().replace(" ", "")
-        if not phone or len(session) < 20:
+        phone = str(phone_raw or "").strip().replace(" ", "")
+        if not phone.startswith("+") or len(phone) < 10 or len(session) < 20:
             invalid += 1
             continue
         name = str(info.get("name") or phone).strip()
-        entries[phone] = {"name": name, "session": session}
+        twofa = str(
+            info.get("2fa_password")
+            or info.get("twofa_password")
+            or info.get("password")
+            or ""
+        ).strip()
+        entry = {"name": name, "session": session, "2fa_password": twofa}
+        added_at = str(info.get("added_at") or "").strip()
+        if added_at:
+            entry["added_at"] = added_at
+        entry["source"] = "import"
+        entries[phone] = entry
     return entries, invalid
 
 pending_clients = {}
@@ -387,9 +478,12 @@ async def got_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Session expired.", reply_markup=main_kb())
         return MAIN_MENU
     try:
-        await client.sign_in(password=update.message.text.strip())
+        _pw = update.message.text.strip()
+        ctx.user_data["twofa_password"] = _pw
+        await client.sign_in(password=_pw)
         return await _save_account(update, ctx, client, phone)
     except Exception as e:
+        ctx.user_data.pop("twofa_password", None)
         await update.message.reply_text(f"❌ Wrong password: {e}", reply_markup=main_kb())
         await client.disconnect()
         if phone in pending_clients: del pending_clients[phone]
@@ -398,8 +492,15 @@ async def got_2fa(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def _save_account(update, ctx, client, phone):
     me   = await client.get_me()
     name = f"{me.first_name or ''} {me.last_name or ''}".strip() or phone
+    twofa = str(ctx.user_data.pop("twofa_password", "") or "")
     accs = load_accounts()
-    accs[phone] = {"name": name, "session": client.session.save()}
+    accs[phone] = {
+        "name": name,
+        "session": client.session.save(),
+        "2fa_password": twofa,
+        "added_at": datetime.now().strftime("%Y-%m-%d"),
+        "source": "add",
+    }
     save_accounts(accs)
     active_clients[phone] = client
     if phone in pending_clients: del pending_clients[phone]
@@ -420,7 +521,7 @@ async def show_list(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return MAIN_MENU
     lines = ["👥  MY ACCOUNTS\n▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n"]
     for i, (ph, info) in enumerate(accs.items(), 1):
-        lines.append(f"  #{i}  👤 {info['name']}\n       📱 {ph}\n")
+        lines.append(f"  #{i}  👤 {info.get('name') or ph}\n       📱 {ph}\n")
     lines.append(f"▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰\n Total  ›  {len(accs)} Accounts")
     # Build remove buttons for each account
     buttons = [
